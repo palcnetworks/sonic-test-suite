@@ -119,7 +119,7 @@ devices:
         device_type: {{device_types[dut]}}
         access: {protocol: {{ts_protocol[dut]}}, ip: {{ts_ip[dut]}}, port: {{ts_ports[dut]}}}
         rps: {model: {{rps_info["model"]}}, ip: {{rps_info["ip"][dut]}}, port: {{rps_info["port"][dut]}}, outlet: '{{rps_info["outlet"][dut]}}', username: '{{rps_info["username"]}}', password: '{{rps_info["password"]}}'}
-        credentials: {username: admin, password: {{passwords[dut]}}, altpassword: {{alt_passwords[dut]}}}
+        credentials: {username: {{usernames[dut]}}, password: {{passwords[dut]}}, altpassword: {{alt_passwords[dut]}}}
         properties: {config: default, build: default, services: default, params: def_dut, speed: default}
         params: {chip: {{dut_tbchips[dut]}}}
     {% endfor %}
@@ -454,12 +454,13 @@ cd $(dirname $0)
 $DOCKERC system prune -f
 
 OPTS="--privileged"
+OPTS="$OPTS --cgroupns=host"
 OPTS="$OPTS --restart always"
 #OPTS="$OPTS --rm"
 OPTS="$OPTS -d"
 OPTS="$OPTS --device /dev/kvm:/dev/kvm"
 OPTS="$OPTS -v $SHARE/$VM_NAME:/data:rw"
-OPTS="$OPTS --volume /sys/fs/cgroup:/sys/fs/cgroup:ro"
+OPTS="$OPTS --volume /sys/fs/cgroup:/sys/fs/cgroup:rw"
 {%- for IMG in IMAGES %}
 OPTS="$OPTS -v {{IMAGES[IMG]}}:/images/{{IMG}}"
 {%- endfor %}
@@ -490,7 +491,22 @@ OPTS="$OPTS --env SPYTEST_DOCKER_HOST=unix://var/run/docker.sock"
 OPTS="$OPTS --env SPYTEST_RUN=$RUN"
 #OPTS="$OPTS --env APT_PROXY_IP=$APT_PROXY_IP"
 OPTS="$OPTS -h $VM_NAME --name $VM_NAME"
-#OPTS="$OPTS --network host"
+{%- if HAS_PHYSICAL %}
+OPTS="$OPTS --network host"
+{%- endif %}
+{%- if HAS_PHYSICAL %}
+if [ "$RUN" = "remove" ]; then
+  {%- for NIC in PHYSICAL_NICS %}
+  echo "Releasing physical NIC {{NIC}} from bridge/OVS before teardown"
+  $DOCKERC exec $VM_NAME sh -c '
+    br=$(ovs-vsctl port-to-br {{NIC}} 2>/dev/null)
+    [ -n "$br" ] && ovs-vsctl --if-exists del-port "$br" {{NIC}}
+    ip link set dev {{NIC}} nomaster 2>/dev/null
+    exit 0
+  ' 2>/dev/null
+  {%- endfor %}
+fi
+{%- endif %}
 echo "Removing $VM_NAME Container if exists"
 $DOCKERC ps -aq --filter "name=^$VM_NAME$" | xargs -r -L 1 $DOCKERC rm -f
 # check again
@@ -896,6 +912,8 @@ def parse_topology(arg_list):
             properties.setdefault("D{}".format(res.group(1)), dict())["CHIP"] = res.group(2)
         elif res.search(r"^D(\d+)IMAGE[:=](\S+)$", arg):
             properties.setdefault("D{}".format(res.group(1)), dict())["IMAGE"] = res.group(2)
+        elif res.search(r"^D(\d+)PHYSICAL[:=](\S+)$", arg):
+            properties.setdefault("D{}".format(res.group(1)), dict())["PHYSICAL"] = res.group(2)
         elif res.search(r"^COMMENT[:=](\S+)$", arg, re.IGNORECASE):
             properties.setdefault(None, dict())["COMMENT"] = res.group(1)
         elif res.search(r"^POD[:=](\S+)$", arg, re.IGNORECASE):
@@ -955,6 +973,28 @@ def prepare_topology(topology, def_chip):
     for dut in duts:
         images[dut] = properties.get(dut, {}).get("IMAGE", "default")
 
+    # DxPHYSICAL:<nic>:<mgmt_ip>[:<mgmt_port>:<username>:<password>] marks a node
+    # as real hardware -- skip build/boot, bridge <nic> to it instead of a VM/container.
+    physical = OrderedDict()
+    for dut in duts:
+        raw = properties.get(dut, {}).get("PHYSICAL")
+        if not raw:
+            continue
+        fields = raw.split(":")
+        if not fields or not fields[0]:
+            logger.error("%sPHYSICAL requires at least a NIC name", dut)
+            sys.exit(0)
+        if len(fields) < 2 or not fields[1]:
+            logger.error("%sPHYSICAL requires NIC:MGMT_IP", dut)
+            sys.exit(0)
+        physical[dut] = SpyTestDict(
+            nic=fields[0],
+            mgmt_ip=fields[1],
+            mgmt_port=int(fields[2]) if len(fields) > 2 else 22,
+            username=fields[3] if len(fields) > 3 else "admin",
+            password=fields[4] if len(fields) > 4 else "",
+        )
+
     dut_list = list(duts.keys())
     dut_list.sort(key=lambda x: float(x.strip('D')))
     topo_info = SpyTestDict()
@@ -966,6 +1006,7 @@ def prepare_topology(topology, def_chip):
     topo_info.dut_chips = chips
     topo_info.dut_names = names
     topo_info.dut_images = images
+    topo_info.dut_physical = physical
     topo_info.properties = properties
     topo_info.dut_pods = pods
     return topo_info
@@ -1007,6 +1048,10 @@ def is_vs_device(wap, dut):
     return match_chip(wap, dut, "vs")
 
 
+def is_physical_device(wap, dut):
+    return dut in wap.topo_info.dut_physical
+
+
 def map_chip(wap, chip):
     return chip
 
@@ -1044,14 +1089,24 @@ def create_testbed(wap, ipaddr=None, file_path=None):
         wap.container_ip = ipaddr
     device_types = {}
     dut_names, dut_tbchips = {}, {}
-    passwords, alt_passwords = {}, {}
+    passwords, alt_passwords, usernames = {}, {}, {}
     console_port_map = {}
     for dut in dut_list:
         ts_protocol.setdefault(dut, "telnet")
         ts_ip.setdefault(dut, wap.container_ip)
+        usernames[dut] = "admin"
         dut_names[dut] = get_dut_name(wap, dut)
         dut_tbchips[dut] = map_tb_chip(wap, dut_chips[dut])
-        if is_arista_device(wap, dut):
+        if is_physical_device(wap, dut):
+            phy = wap.topo_info.dut_physical[dut]
+            device_types[dut] = "sonic"
+            ts_protocol[dut] = "ssh"
+            ts_ip[dut] = phy.mgmt_ip
+            dut_console[dut] = phy.mgmt_port
+            usernames[dut] = phy.username
+            passwords[dut] = phy.password
+            alt_passwords[dut] = phy.password
+        elif is_arista_device(wap, dut):
             device_types[dut] = "veos"
             passwords[dut] = "arista"
         elif is_vs_device(wap, dut):
@@ -1060,7 +1115,7 @@ def create_testbed(wap, ipaddr=None, file_path=None):
         else:
             device_types[dut] = "vsonic"
             passwords[dut] = "broadcom"
-        alt_passwords[dut] = "YourPaSsWoRd"
+        alt_passwords.setdefault(dut, "YourPaSsWoRd")
         rps_info["outlet"][dut] = dut_names[dut]
         rps_info["ip"][dut] = wap.container_ip
     for dut in get_all_dev_list(wap, dut_list):
@@ -1076,6 +1131,7 @@ def create_testbed(wap, ipaddr=None, file_path=None):
                        dut_names=dut_names, tg_type=wap.tg_type,
                        tg_version=wap.tg_version,
                        passwords=alt_passwords, alt_passwords=passwords,
+                       usernames=usernames,
                        dut_tbchips=dut_tbchips, rps_info=rps_info)
 
     if file_path:
@@ -1296,6 +1352,14 @@ def ovs_add_port(cmds, br, sport, dport, si, di):
 
 def add_port(wap, cmds, src, dst, local, remote, si, di):
     sport, dport = "{}P{}".format(src, local), "{}P{}".format(dst, remote)
+    if is_physical_device(wap, src) or is_physical_device(wap, dst):
+        if wap.platform in ["docker"]:
+            logger.error("physical DUTs are not supported with --platform docker")
+            sys.exit(0)
+        if is_physical_device(wap, src):
+            sport = wap.topo_info.dut_physical[src].nic
+        if is_physical_device(wap, dst):
+            dport = wap.topo_info.dut_physical[dst].nic
     if wap.platform in ["docker"]:
         local += 1
         remote += 0 if dst == "T" else 1
@@ -1360,6 +1424,8 @@ def tool_build_kwargs(wap):
     kwargs.update({"IMAGES": mnt_images})
     kwargs.update({"DIND": bool(wap.dind and wap.platform in ["docker"])})
     kwargs.update({"tool_name": tool_name})
+    kwargs.update({"HAS_PHYSICAL": bool(wap.topo_info.dut_physical)})
+    kwargs.update({"PHYSICAL_NICS": [v.nic for v in wap.topo_info.dut_physical.values()]})
     return kwargs
 
 
@@ -1529,11 +1595,16 @@ def helper_topo_vm(wap):
 
     # save image as device image based on image type
     for dut, image in wap.topo_info.dut_images.items():
+        if is_physical_device(wap, dut):
+            continue
         dut_name = get_dut_name(wap, dut)
         copy_file(f"/images/{image}", f"{images}/{dut_name}.img")
 
-    # create device xml files
+    # create device xml files -- physical DUTs have no VM, they are bridged
+    # directly by add_port()/ovs_add_port() using their real NIC name
     for dut in wap.topo_info.dut_list:
+        if is_physical_device(wap, dut):
+            continue
         dut_name = get_dut_name(wap, dut)
         lwrite(work, f"{dut_name}.xml", vmxml_tmpl_text,
                dut=dut, ports=links[dut], vmem=wap.mem, vcpu=wap.cpu,
@@ -1545,6 +1616,8 @@ def helper_topo_vm(wap):
 
     # start devices
     for dut in wap.topo_info.dut_list:
+        if is_physical_device(wap, dut):
+            continue
         dut_name = get_dut_name(wap, dut)
         os_system(f"virsh -l {work}/{dut_name}.log -q define {work}/{dut_name}.xml")
         os_system(f"virsh start {dut_name}")

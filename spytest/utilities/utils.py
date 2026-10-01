@@ -1191,6 +1191,25 @@ def get_random_string(N=4):
                                  + string.digits, k=N))
 
 
+def get_random_space_string(min_spaces=0, max_spaces=1):
+    """
+    Return a string of a random number of space characters.
+    Used when constructing CLI commands where some platforms allow an
+    optional space between parts of an identifier (e.g. Management0 vs Management 0).
+    :param min_spaces:
+    :param max_spaces:
+    :return:
+    """
+    try:
+        min_spaces = int(min_spaces)
+        max_spaces = int(max_spaces)
+    except (TypeError, ValueError):
+        min_spaces, max_spaces = 0, 1
+    if min_spaces > max_spaces:
+        min_spaces, max_spaces = max_spaces, min_spaces
+    count = random.randint(min_spaces, max_spaces) if min_spaces >= 0 else 0
+    return " " * max(count, 0)
+
 def get_traffic_loss_duration(tx_count, rx_count, tx_rate):
     '''
 
